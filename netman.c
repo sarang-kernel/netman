@@ -12,6 +12,7 @@
 // --- Function Prototypes ---
 void init_ncurses();
 void cleanup_ncurses();
+void show_loading_animation(const char* command, const char* message);
 void run_system_command_interactive(const char* command);
 void draw_menu(WINDOW *win, const char *title, const char **choices, int n_choices, int highlight, int start_y, int start_x);
 void popup_message(const char *title, const char *message);
@@ -35,6 +36,7 @@ void init_ncurses() {
         start_color();
         init_pair(1, COLOR_CYAN, COLOR_BLACK);
         init_pair(2, COLOR_BLACK, COLOR_CYAN);
+        init_pair(3, COLOR_YELLOW, COLOR_BLACK); // For logo
     }
 }
 
@@ -43,18 +45,56 @@ void cleanup_ncurses() {
 }
 
 /**
- * @brief Temporarily exits ncurses to run a command that might need the raw terminal (e.g., for PIN entry).
+ * @brief Displays a loading spinner while a command runs in the background.
+ * Uses fork() to run the command in a child process.
  */
-void run_system_command_interactive(const char* command) {
-    cleanup_ncurses();
-    printf("\n--- Executing command, please follow prompts in terminal ---\n");
-    system(command);
-    printf("--- Command finished, press ENTER to return to the TUI ---\n");
-    while (getchar() != '\n'); // Clear input buffer
-    init_ncurses();
+void show_loading_animation(const char* command, const char* message) {
+    int height = 7, width = 50;
+    int starty = (LINES - height) / 2;
+    int startx = (COLS - width) / 2;
+    WINDOW *win = newwin(height, width, starty, startx);
+    box(win, 0, 0);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        popup_message("Error", "Failed to fork process.");
+        return;
+    }
+
+    if (pid == 0) { // Child process
+        // Redirect stdout and stderr to /dev/null to not mess with ncurses
+        freopen("/dev/null", "w", stdout);
+        freopen("/dev/null", "w", stderr);
+        execl("/bin/sh", "sh", "-c", command, (char *) NULL);
+        _exit(127); // Exit if execl fails
+    } else { // Parent process
+        const char *spinner = "|/-\\";
+        int i = 0;
+        int status;
+        nodelay(win, TRUE); // Make wgetch non-blocking
+
+        while (waitpid(pid, &status, WNOHANG) == 0) {
+            mvwprintw(win, 2, 3, "%s", message);
+            mvwprintw(win, 4, (width / 2), "%c", spinner[i % 4]);
+            wrefresh(win);
+            i++;
+            usleep(100000); // 100ms delay
+        }
+    }
+    delwin(win);
+    touchwin(stdscr);
     refresh();
 }
 
+void run_system_command_interactive(const char* command) {
+    cleanup_ncurses();
+    printf("\n--- Executing command, please follow prompts in terminal ---\n\n");
+    system(command);
+    printf("\n--- Command finished, press ENTER to return to the TUI ---\n");
+    while (getchar() != '\n');
+    init_ncurses();
+    refresh();
+}
 
 void draw_menu(WINDOW *win, const char *title, const char **choices, int n_choices, int highlight, int start_y, int start_x) {
     werase(win);
@@ -63,7 +103,7 @@ void draw_menu(WINDOW *win, const char *title, const char **choices, int n_choic
     mvwprintw(win, 1, (getmaxx(win) - strlen(title)) / 2, "%s", title);
     wattroff(win, A_BOLD | COLOR_PAIR(1));
     wattron(win, A_DIM);
-    mvwprintw(win, getmaxy(win) - 2, 2, "j/k/Arrows: Navigate | Enter: Select | q/ESC: Back");
+    mvwprintw(win, getmaxy(win) - 2, 2, "j/k/Arrows: Nav | Enter: Select | q/ESC: Back");
     wattroff(win, A_DIM);
 
     for (int i = 0; i < n_choices; ++i) {
@@ -173,22 +213,17 @@ void wifi_manager_loop() {
 
                 switch (choice) {
                     case 0: // Scan
-                        popup_message("Scanning...", "Scanning for Wi-Fi networks...");
-                        system("iwctl station wlan0 scan > /dev/null 2>&1");
+                        show_loading_animation("iwctl station wlan0 scan", "Scanning for Wi-Fi networks...");
                         popup_message("Scan Complete", "Network scan finished.");
                         break;
                     case 1: // List & Connect
-                        // This command now formats the output cleanly into three columns.
                         count = execute_command_and_parse("iwctl station wlan0 get-networks | tail -n +2 | awk '{ printf(\"%-25s %-15s %s\\n\", $1, $2, $3) }'", lines, MAX_ITEMS);
                         if (display_list_and_get_selection("Available Wi-Fi Networks (SSID | Security | Signal)", lines, count, selected_item) != -1) {
                             char ssid[MAX_LEN] = {0}, password[MAX_LEN] = {0};
-                            sscanf(selected_item, "%s", ssid); // Extract just the SSID
+                            sscanf(selected_item, "%s", ssid);
                             get_input_from_dialog("Password Required (leave blank for open networks)", ssid, password, 1);
-                            if (strlen(password) > 0) {
-                                snprintf(command, sizeof(command), "iwctl station wlan0 connect \"%s\" --passphrase \"%s\"", ssid, password);
-                            } else {
-                                snprintf(command, sizeof(command), "iwctl station wlan0 connect \"%s\"", ssid);
-                            }
+                            if (strlen(password) > 0) snprintf(command, sizeof(command), "iwctl station wlan0 connect \"%s\" --passphrase \"%s\"", ssid, password);
+                            else snprintf(command, sizeof(command), "iwctl station wlan0 connect \"%s\"", ssid);
                             if (system(command) == 0) popup_message("Success", "Connected successfully.");
                             else popup_message("Failure", "Failed to connect.");
                         }
@@ -201,11 +236,8 @@ void wifi_manager_loop() {
                         remove("/tmp/netman_status");
                         popup_message("Wi-Fi Status", strlen(output) > 0 ? output : "Not connected or device not found.");
                         break;
-                    case 3: // Disconnect
-                        system("iwctl station wlan0 disconnect");
-                        popup_message("Wi-Fi", "Disconnected from network.");
-                        break;
-                    case 4: // Forget Network
+                    case 3: system("iwctl station wlan0 disconnect"); popup_message("Wi-Fi", "Disconnected from network."); break;
+                    case 4:
                         count = execute_command_and_parse("iwctl known-networks list | tail -n +2 | awk '{print $1}'", lines, MAX_ITEMS);
                          if (display_list_and_get_selection("Forget a Network", lines, count, selected_item) != -1) {
                             snprintf(command, sizeof(command), "iwctl known-networks %s forget", selected_item);
@@ -244,30 +276,28 @@ void bluetooth_manager_loop() {
 
                 switch (choice) {
                     case 0: // Power Toggle
-                        if (system("echo -e 'show\nexit' | bluetoothctl | grep -q 'Powered: yes'") == 0) {
-                            system("echo -e 'power off\nexit' | bluetoothctl > /dev/null");
+                        if (system("echo -e 'show\\nexit' | bluetoothctl | grep -q 'Powered: yes'") == 0) {
+                            system("echo -e 'power off\\nexit' | bluetoothctl > /dev/null");
                             popup_message("Bluetooth", "Powered OFF.");
                         } else {
-                            system("echo -e 'power on\nexit' | bluetoothctl > /dev/null");
+                            system("echo -e 'power on\\nexit' | bluetoothctl > /dev/null");
                             popup_message("Bluetooth", "Powered ON.");
                         }
                         break;
                     case 1: // Scan
-                        popup_message("Scanning...", "Scanning for devices for 10s...");
-                        // This is a cleaner way to scan without hanging or using pkill
-                        system("(echo 'scan on' ; sleep 10 ; echo 'scan off') | bluetoothctl > /dev/null");
+                        show_loading_animation("(echo 'scan on' ; sleep 10 ; echo 'scan off') | bluetoothctl", "Scanning for Bluetooth devices...");
                         popup_message("Scan Complete", "Device scan finished.");
                         break;
                     case 2: // List/Pair/Connect
-                        count = execute_command_and_parse("echo -e 'devices\nexit' | bluetoothctl | sed 's/Device //' | awk '{$1=$1;print}'", lines, MAX_ITEMS);
+                        count = execute_command_and_parse("echo -e 'devices\\nexit' | bluetoothctl | sed 's/Device //' | awk '{$1=$1;print}'", lines, MAX_ITEMS);
                         if (display_list_and_get_selection("Available Bluetooth Devices", lines, count, selected_item) != -1) {
                             char mac[18];
-                            sscanf(selected_item, "%s", mac); // Extract MAC address
+                            sscanf(selected_item, "%s", mac);
                             const char *actions[] = {"Pair", "Connect", "Cancel"};
                             char action_choice[MAX_LEN];
                             if (display_list_and_get_selection("Action", (char**)actions, 3, action_choice) != -1) {
-                                if (strcmp(action_choice, "Pair") == 0) snprintf(command, sizeof(command), "echo -e 'pair %s\\nexit' | bluetoothctl", mac);
-                                else if (strcmp(action_choice, "Connect") == 0) snprintf(command, sizeof(command), "echo -e 'connect %s\\nexit' | bluetoothctl", mac);
+                                if (strcmp(action_choice, "Pair") == 0) snprintf(command, sizeof(command), "bluetoothctl pair %s", mac);
+                                else if (strcmp(action_choice, "Connect") == 0) snprintf(command, sizeof(command), "bluetoothctl connect %s", mac);
                                 else command[0] = '\0';
 
                                 if (strlen(command) > 0) {
@@ -279,7 +309,7 @@ void bluetooth_manager_loop() {
                         for (int i = 0; i < count; i++) free(lines[i]);
                         break;
                     case 3: // Disconnect
-                        count = execute_command_and_parse("echo -e 'devices Connected\nexit' | bluetoothctl | sed 's/Device //' | awk '{$1=$1;print}'", lines, MAX_ITEMS);
+                        count = execute_command_and_parse("echo -e 'devices Connected\\nexit' | bluetoothctl | sed 's/Device //' | awk '{$1=$1;print}'", lines, MAX_ITEMS);
                         if (display_list_and_get_selection("Disconnect a Device", lines, count, selected_item) != -1) {
                             char mac[18];
                             sscanf(selected_item, "%s", mac);
@@ -304,23 +334,35 @@ void main_menu_loop() {
     int highlight = 0;
     const char *logo[] = { "  _   _      _   _             ", " | \\ | |    | | | |            ", " |  \\| | ___| |_| | __ _ _ __  ", " | . ` |/ _ \\ __| |/ _` | '_ \\ ", " | |\\  |  __/ |_| | (_| | | | |", " |_| \\_|\\___|\\__|_|\\__,_|_| |_|" };
     int logo_lines = sizeof(logo) / sizeof(char *);
-    int menu_h = n_choices + 4, menu_w = 35;
-    int menu_y = logo_lines + 5, menu_x = (COLS - menu_w) / 2;
-    WINDOW *menu_win = newwin(menu_h, menu_w, menu_y, menu_x);
-    keypad(menu_win, TRUE);
+    
+    WINDOW *main_win = newwin(LINES, COLS, 0, 0);
+    keypad(main_win, TRUE);
 
     while (1) {
-        clear();
-        attron(A_BOLD | COLOR_PAIR(1));
-        for (int i = 0; i < logo_lines; i++) mvprintw(i + 2, (COLS - strlen(logo[i])) / 2, "%s", logo[i]);
-        attroff(A_BOLD | COLOR_PAIR(1));
-        attron(A_DIM);
-        mvprintw(logo_lines + 3, (COLS - 30) / 2, "A Vim-Style Network Manager");
-        attroff(A_DIM);
-        refresh();
-        draw_menu(menu_win, "", choices, n_choices, highlight, 2, 3);
+        werase(main_win);
+        box(main_win, 0, 0);
 
-        int c = wgetch(menu_win);
+        wattron(main_win, A_BOLD | COLOR_PAIR(3));
+        for (int i = 0; i < logo_lines; i++) mvwprintw(main_win, i + 2, (COLS - strlen(logo[i])) / 2, "%s", logo[i]);
+        wattroff(main_win, A_BOLD | COLOR_PAIR(3));
+        
+        wattron(main_win, A_DIM);
+        mvwprintw(main_win, logo_lines + 3, (COLS - 30) / 2, "A Vim-Style Network Manager");
+        wattroff(main_win, A_DIM);
+        
+        int menu_y = logo_lines + 6;
+        for (int i = 0; i < n_choices; ++i) {
+            if (highlight == i) {
+                wattron(main_win, COLOR_PAIR(2));
+                mvwprintw(main_win, menu_y + i, (COLS - strlen(choices[i])) / 2, " > %s < ", choices[i]);
+                wattroff(main_win, COLOR_PAIR(2));
+            } else {
+                mvwprintw(main_win, menu_y + i, (COLS - strlen(choices[i])) / 2, "   %s   ", choices[i]);
+            }
+        }
+        wrefresh(main_win);
+
+        int c = wgetch(main_win);
         int choice = -1;
         switch (c) {
             case 'k': case KEY_UP: if (highlight > 0) highlight--; break;
@@ -336,7 +378,7 @@ void main_menu_loop() {
                 case 0: wifi_manager_loop(); break;
                 case 1: bluetooth_manager_loop(); break;
                 case 2: popup_message("Help", "Navigate with j/k or arrows. Enter to select. q/ESC to go back. Run with sudo!"); break;
-                case 3: delwin(menu_win); return;
+                case 3: delwin(main_win); return;
             }
         }
     }
